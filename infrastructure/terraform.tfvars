@@ -5,6 +5,6 @@ acr_name = "analytics-staging-acr-2025-09-02"
 proxy_app_name = "analytics-proxy"
 backend_app_name = "analytics-backend"
 basic_auth_user = "staging_user"
-basic_auth_pass = "changeme"
+basic_auth_pass = "Analytics-Seguridad-2025"
 admin_email = "adrianmogliatti@msn.com"
 
