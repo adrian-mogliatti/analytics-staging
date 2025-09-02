@@ -1,1 +1,90 @@
+name: Build & Deploy to Azure (staging)
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  RESOURCE_GROUP: '<replace-with-tf-resource-group-name>' # e.g. analytics-rg
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACR login server
+        id: acr
+        run: |
+          ACR_NAME=${{ secrets.ACR_NAME }}
+          LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)
+          echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
+          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_OUTPUT
+
+      - name: Azure ACR login
+        run: az acr login -n ${{ secrets.ACR_NAME }}
+
+      - name: Build & push backend image
+        run: |
+          docker build -t ${{ steps.acr.outputs.LOGIN_SERVER }}/backend:latest app/backend
+          docker push ${{ steps.acr.outputs.LOGIN_SERVER }}/backend:latest
+
+      - name: Build & push proxy image (includes frontend build copy if any)
+        run: |
+          # if you have a frontend build step, build and copy into app/proxy before building proxy image
+          # e.g., (cd app/frontend && npm ci && npm run build && cp -r build/* ../proxy/html/)
+          docker build -t ${{ steps.acr.outputs.LOGIN_SERVER }}/proxy:latest app/proxy
+          docker push ${{ steps.acr.outputs.LOGIN_SERVER }}/proxy:latest
+
+      - name: Get ACR credentials
+        id: acrcreds
+        run: |
+          ACR_NAME=${{ secrets.ACR_NAME }}
+          az acr credential show -n $ACR_NAME --query '{username:username,password:passwords[0].value}' -o json > acr-creds.json
+          cat acr-creds.json
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+
+      - name: Extract ACR creds
+        run: |
+          export ACR_LOGIN_SERVER=${{ steps.acr.outputs.LOGIN_SERVER }}
+          export ACR_USERNAME=$(jq -r '.username' acr-creds.json)
+          export ACR_PASSWORD=$(jq -r '.password' acr-creds.json)
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+          echo "ACR_USERNAME=$ACR_USERNAME" >> $GITHUB_OUTPUT
+          echo "ACR_PASSWORD=$ACR_PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Update backend App Service to use new image
+        run: |
+          BACKEND_APP=${{ secrets.BACKEND_APP_NAME }}
+          RESOURCE_GROUP=${{ env.RESOURCE_GROUP }}
+          image=${{ steps.acr.outputs.LOGIN_SERVER }}/backend:latest
+          az webapp config container set --name $BACKEND_APP --resource-group $RESOURCE_GROUP \
+            --docker-custom-image-name $image \
+            --docker-registry-server-url https://${{ steps.acr.outputs.LOGIN_SERVER }} \
+            --docker-registry-server-user $(jq -r '.username' acr-creds.json) \
+            --docker-registry-server-password $(jq -r '.password' acr-creds.json)
+
+      - name: Update proxy App Service to use new image & set BACKEND_HOST
+        run: |
+          PROXY_APP=${{ secrets.PROXY_APP_NAME }}
+          BACKEND_APP=${{ secrets.BACKEND_APP_NAME }}
+          RESOURCE_GROUP=${{ env.RESOURCE_GROUP }}
+          image=${{ steps.acr.outputs.LOGIN_SERVER }}/proxy:latest
+          # Set container image
+          az webapp config container set --name $PROXY_APP --resource-group $RESOURCE_GROUP \
+            --docker-custom-image-name $image \
+            --docker-registry-server-url https://${{ steps.acr.outputs.LOGIN_SERVER }} \
+            --docker-registry-server-user $(jq -r '.username' acr-creds.json) \
+            --docker-registry-server-password $(jq -r '.password' acr-creds.json)
+
+          # Set app setting BACKEND_HOST to the backend app's default hostname
+          BACKEND_HOST=$(az webapp show --name $BACKEND_APP --resource-group $RESOURCE_GROUP --query defaultHostName -o tsv)
+          az webapp config appsettings set --name $PROXY_APP --resource-group $RESOURCE_GROUP --settings BACKEND_HOST=$BACKEND_HOST
 
